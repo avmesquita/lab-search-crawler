@@ -1,0 +1,96 @@
+services:
+  # 1. Motor de busca/raspagem sem rastreamento para obter URLs de entrada
+  searxng:
+    image: searxng/searxng:latest
+    container_name: mini_search_engine
+    ports:
+      - "3335:80"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - INSTANCE_NAME=mini-search-cache
+      - SEARXNG_BASE_URL=http://searxng.lab.local/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-mini-search-dev-secret-change-this}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    restart: unless-stopped
+
+  # 2. Banco Chave-Valor rápido para servir o HTML bruto (O seu "Google Cache" local)
+  redis-cache:
+    image: redis:7-alpine
+    container_name: mini_search_cache
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6369:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: mini_search_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-mini_search}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-mini_search_dev}
+    ports:
+      - "6670:5672"
+      - "6671:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  search-worker:
+    build: ./worker/src
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+    environment:
+      - WORKER_ROLE=search
+      - RABBITMQ_CONNECTION_STRING=amqp://${RABBITMQ_USER:-mini_search}:${RABBITMQ_PASSWORD:-mini_search_dev}@rabbitmq:5672
+      - SEARCH_WORKER_QUEUE=mini-search-search-worker
+      - CRAWLER_WORKER_QUEUE=mini-search-crawler-worker
+      - SEARXNG_BASE_URL=http://searxng.lab.local/
+      - SEARCH_QUERIES=dotnet,asp.net core
+      - SEARCH_INTERVAL_SECONDS=3600
+      - SEARCH_RETRY_INTERVAL_SECONDS=60
+      - REBUS_WORKERS=1
+      - REBUS_MAX_PARALLELISM=1
+    restart: unless-stopped
+
+  crawler-worker:
+    build: ./worker/src
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    environment:
+      - WORKER_ROLE=crawler
+      - RABBITMQ_CONNECTION_STRING=amqp://${RABBITMQ_USER:-mini_search}:${RABBITMQ_PASSWORD:-mini_search_dev}@rabbitmq:5672
+      - SEARCH_WORKER_QUEUE=mini-search-search-worker
+      - CRAWLER_WORKER_QUEUE=mini-search-crawler-worker
+      - REDIS_HOST=redis-cache:6379
+      - CACHE_TTL_SECONDS=86400
+      - REBUS_WORKERS=2
+      - REBUS_MAX_PARALLELISM=2
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  rabbitmq_data:
